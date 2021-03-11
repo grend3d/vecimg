@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <string.h>
 #include <assert.h>
@@ -78,8 +79,8 @@ float rotation_error(uint32_t main, uint32_t sec,
 {
 	float ret = 0.f;
 
-	float rad = 2*M_PI * (rot / 255.f);
-	float offset = ((off / 255.f) - 0.5) * 2.f;
+	float rad = M_PI * (rot / 255.f);
+	float offset = ((off / 255.f) * 2.f) - 1.f;
 
 	float pnorm[2] = {
 		cosf(rad),
@@ -110,33 +111,76 @@ float rotation_error(uint32_t main, uint32_t sec,
 	return ret;
 }
 
-typedef struct uint8_pair {
+typedef struct encoded {
 	uint8_t first;
 	uint8_t second;
-} u8_pair;
+	uint8_t rotation;
+	uint8_t offset;
+} encoded;
 
-u8_pair encode_rotation(uint32_t main, uint32_t sec,
+enum swapmode {
+	Given,
+	Swapped,
+	Discard,
+};
+
+encoded encode_rotation(uint8_t main, uint8_t sec,
                         uint32_t *pixbuf, unsigned blocksize,
                         unsigned initial_step)
 {
 	float min = HUGE_VALF;
 	uint8_t currot = 0;
 	uint8_t curoff = 0;
+	uint8_t curmain = 0;
+	uint8_t cursec  = 0;
 
 	int off_lower = 0, off_upper = 0x100;
 	int rot_lower = 0, rot_upper = 0x100;
 	int step = initial_step;
 
-	// TODO: could probably do some fancy gradient descent thing
-	while (step) {
-		for (int off = off_lower; off < off_upper; off += step) {
-			for (int rot = rot_lower; rot < rot_upper; rot += step) {
-				float err = rotation_error(main, sec, pixbuf, blocksize, rot, off);
+	if (main == sec) {
+		// nothing to do if the colors are the same
+		return (encoded){main, main, 0, 0};
+	}
 
-				if (err < min) {
-					currot = rot;
-					curoff = off;
-					min = err;
+	uint32_t colora = rgb332_to_rgb8(main); 
+	uint32_t colorb = rgb332_to_rgb8(sec); 
+
+	while (step) {
+		//unsigned mode = Given;
+		for (unsigned mode = Given; mode <= Discard; mode++) {
+			for (int off = off_lower; off < off_upper; off += step) {
+				for (int rot = rot_lower; rot < rot_upper; rot += step) {
+					uint32_t a, b;
+
+					switch (mode) {
+						case Given:
+							a = colora;
+							b = colorb;
+							break;
+
+						case Swapped:
+							a = colorb;
+							b = colora;
+							break;
+
+						case Discard:
+							//a = colorb;
+							//b = colora;
+							a = b = colora;
+							break;
+					}
+
+					float err = rotation_error(a, b, pixbuf, blocksize, rot, off);
+
+					if (err < min) {
+						min = err;
+
+						curmain = rgb8_to_rgb332(a);
+						cursec  = rgb8_to_rgb332(b);
+						currot = rot;
+						curoff = off;
+					}
 				}
 			}
 		}
@@ -155,7 +199,12 @@ u8_pair encode_rotation(uint32_t main, uint32_t sec,
 			min, curmin, curoff);
 			*/
 
-	return (u8_pair){currot, curoff};
+	return (encoded){
+		curmain,
+		cursec,
+		currot,
+		curoff,
+	};
 }
 
 uint32_t encode_block(struct pximg *in,
@@ -182,30 +231,19 @@ uint32_t encode_block(struct pximg *in,
 				size_t yidx = y + by;
 
 				px |= in->data[xidx + str*yidx] << ((2 - chan) * 8);
-				//ret[chan] += in->data[xidx + str*yidx] / 255.f;
-				//ret[chan] += in->data[xidx + str*yidx];
 			}
 
 			uint8_t conv = rgb8_to_rgb332(px);
 			counts[conv]++;
 
-			//pixbuf[bx + blocksize*by] = px;
-			pixbuf[bx + blocksize*by] = rgb332_to_rgb8(conv);
+			// TODO: converting before correction results in no color splotches,
+			//       but less accurate/jagged edges, need to figure out a way
+			//       to avoid that
+			//       (could try dithering to rgb332 before)
+			//pixbuf[bx + blocksize*by] = rgb332_to_rgb8(conv);
+			pixbuf[bx + blocksize*by] = px;
 		}
 	}
-
-	/*
-	uint32_t px = 0;
-	for (unsigned i = 0; i < 3; i++) {
-		px |= (((uint32_t)(((ret[i] / (blocksize * blocksize)) * 0xff)) & 0xff) << ((2-i) * 8));
-	}
-
-	// TODO: alpha channel
-	//px |= (((uint32_t)(((ret[3] / blocksize) * 0xff)) & 0xff) << 24);
-	//px = (ret[0] / blocksize) * 0xff;
-
-	return rgb232_to_rgb8(rgb8_to_rgb232(px));
-	*/
 
 	unsigned max = 0;
 	unsigned sec = 0;
@@ -227,29 +265,18 @@ uint32_t encode_block(struct pximg *in,
 		}
 	}
 
-	uint8_t rot = 0;
-	uint8_t off = 0;
-	if (counts[sec] == 0) {
+	/* ignore small secondary counts TODO: configurable */
+	//if (counts[sec] < blocksize/3) {
+	if (seccount == 0) {
 		sec = max;
-
-	} else {
-		//off = ((float)(counts[sec])) / (float)(counts[max]);
-		u8_pair rotoff =
-			encode_rotation(rgb332_to_rgb8(max),
-			                rgb332_to_rgb8(sec),
-			                pixbuf, blocksize, initial_step);
-
-		rot = rotoff.first;
-		off = rotoff.second;
 	}
 
-	//return 0xff000000 | swap_lower3_bytes(rgb232_to_rgb8(max));
-	//return rgb232_to_rgb8(max) | (rgb232_to_rgb8(sec));
-	//return curmax | (secondmax << 8);
-	//return max | (sec << 8) | ((x & 0xff) << 16) | ((y & 0xff) << 24);
-	return max | (sec << 8) | (rot << 16) | (off << 24);
-	//return max;
-	//return rgb232_to_rgb8(sec);
+	encoded out = encode_rotation(max, sec, pixbuf, blocksize, initial_step);
+
+	return out.first
+		| (out.second << 8)
+		| (out.rotation << 16)
+		| (out.offset << 24);
 }
 
 void decode_block(struct pximg *out, size_t x, size_t y,
@@ -257,7 +284,7 @@ void decode_block(struct pximg *out, size_t x, size_t y,
 {
 	size_t str = pximg_stride(out);
 
-	float rad = 2*M_PI * (CHANNEL_BLUE(px) / 255.f);
+	float rad = M_PI * (CHANNEL_BLUE(px) / 255.f);
 	float pnorm[2] = {
 		cosf(rad),
 		sinf(rad),
@@ -267,106 +294,25 @@ void decode_block(struct pximg *out, size_t x, size_t y,
 	uint32_t b = rgb332_to_rgb8(CHANNEL_GREEN(px));
 
 	float inc = 2.0 / blocksize;
-	float off = ((CHANNEL_ALPHA(px) / 255.f) - 0.5) * 2.f;
-	//float off = 0.f;
+	float off = ((CHANNEL_ALPHA(px) / 255.f) * 2.f) - 1.f;
 
-	//size_t oy = y * str;
 	size_t oy = 0;
-	for (float by = -1.f;
-	     oy < blocksize;
-	     by += inc, oy++)
-	{
-		//size_t ox = x * blocksize;
+	for (float by = -1.f; oy < blocksize; by += inc, oy++) {
 		size_t ox = 0;
 
-		for (float bx = -1.f;
-			 ox < blocksize;
-		     bx += inc, ox++)
-		{
+		for (float bx = -1.f; ox < blocksize; bx += inc, ox++) {
 			float pos[2] = {bx, by};
 			float dist = dot(pnorm, pos) + off;
-			//float ad = fabs(dist);
-			//float ad = dist*((off < 0.f)? -1.f : 1.f);
-			float ad = dist;
-
 			uint32_t px;
 
-			if (1 /*&& ad < 0.0*/ && a != b) {
-				//float fac = fabs(ad - off);
-				//float fac = ad * 0.5f;
-				//float fac = (0.5 - ad) * 2.f;
-				//float fac = (ad)*-.5f;
-				float asdf = (off > 0.f)? 1.f : -1.f;
-				float fac = (fabs(dist) * 1.0);
-				//float fac = (fabs(dist) * 1.0);
-				//float fac = 1.f - MAX(fabs(pos[0]), fabs(pos[1]));
-				//float foo = (pnorm[0] - pos[0] > 0.f)? 1.f : -1.f;
-				//float bar = (pnorm[1] - pos[1] > 0.f)? 1.f : -1.f;
-				//float foo = (pos[0] - pnorm[0]*asdf);
-				//float bar = (pos[1] - pnorm[1]*asdf);
-				//float fac = foo * bar;
-				//float fac = (MAX(0.f, pos[0]*foo) + MAX(0.f, pos[1]*bar)) * fabs(dist);
-
-				//float fac = pnorm[0] - pos[0] + pnorm[1] - pos[1];
-				fac = MIN(1.f, MAX(0.f, fac));
-				//float fac = 1.0 - (abs(dist) * 0.5);
-				//fac = 1.f - fac;
-
-				uint32_t bla = (dist <  0.f)? a : b;
-				uint32_t blb = (dist >= 0.f)? a : b;
-
-				/*
-				uint32_t rd = mix(CHANNEL_RED(a), CHANNEL_RED(b), fac);
-				uint32_t gr = mix(CHANNEL_GREEN(a), CHANNEL_GREEN(b), fac);
-				uint32_t bl = mix(CHANNEL_BLUE(a), CHANNEL_BLUE(b), fac);
-				uint32_t al = mix(CHANNEL_ALPHA(a), CHANNEL_ALPHA(b), fac);
-				*/
-
-				float burn = 0.7 + 0.3*(fac);
-
-				/*
-				float fr = (fac*CHANNEL_RED(bla)   + (1.f - fac)*CHANNEL_RED(blb));
-				float fg = (fac*CHANNEL_GREEN(bla) + (1.f - fac)*CHANNEL_GREEN(blb));
-				float fb = (fac*CHANNEL_BLUE(bla)  + (1.f - fac)*CHANNEL_BLUE(blb));
-				float fa = (fac*CHANNEL_ALPHA(bla) + (1.f - fac)*CHANNEL_ALPHA(blb));
-				*/
-
-				float fr = (CHANNEL_RED(bla)  );
-				float fg = (CHANNEL_GREEN(bla));
-				float fb = (CHANNEL_BLUE(bla) );
-				float fa = (CHANNEL_ALPHA(bla));
-
-				fr = MAX(0.f, fr * burn);
-				fg = MAX(0.f, fg * burn);
-				fb = MAX(0.f, fb * burn);
-
-				uint32_t rd = ((uint32_t)fr) & 0xff;
-				uint32_t gr = ((uint32_t)fg) & 0xff;
-				uint32_t bl = ((uint32_t)fb) & 0xff;
-				uint32_t al = ((uint32_t)fa) & 0xff;
-
-				//px = a*fac + b*(1.f - fac);
-				px = (al << 24) | (bl << 16) | (gr << 8) | rd;
-				//px = (0xff << 24) | (bl << 16) | (gr << 8) | rd;
-				//px = (al << 24) | (rd << 16) | (gr << 8) | bl;
-				//px = 0xff404040;
-				//px = 0xff000000;
-
-				//px = swap_lower3_bytes(px);
-			} else {
-				px = (dist < 0.f)? a : b;
-			}
-
-
-			//uint32_t px = dist * 255;
-			//uint32_t px = a;
+			px = (dist < 0.f)? a : b;
+			// XXX: no alpha yet
 			px |= 0xff000000;
 
 			size_t offx = x * blocksize + ox;
 			size_t offy = (y*blocksize + oy) * out->width;
 
 			out->pixels[offx + offy] = swap_lower3_bytes(px);
-			//out->pixels[offx + offy] = 0xff0000ff;
 		}
 	}
 }
@@ -439,7 +385,7 @@ struct pximg load_pximg(const char *filename) {
 
 int main(int argc, char *argv[]) {
 	int opt;
-	int blocksize = 7;
+	int blocksize = 8;
 	int initial_step = 16;
 	enum mode mode = Invalid;
 
@@ -460,7 +406,7 @@ int main(int argc, char *argv[]) {
 				break;
 
 			case 'p':
-				// dump palette
+				// TODO: dump palette
 				break;
 
 			case 'q':
