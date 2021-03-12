@@ -1,3 +1,7 @@
+![input image](https://raw.githubusercontent.com/grend3d/vecimg/master/tests/NYSDOT_nostop_small.png) 
+**🡆** ![encoded](https://raw.githubusercontent.com/grend3d/vecimg/master/tests/nostop_out.png)
+**🡆** ![decoded result](https://raw.githubusercontent.com/grend3d/vecimg/master/tests/nostop_decoded.png)
+
 Some tools for encoding/decoding tiny vector images. See the 'shaders' folder
 for shader functions.
 
